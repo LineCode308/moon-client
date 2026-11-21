@@ -1,1117 +1,410 @@
 import asyncio
+import json
 import logging
-import os
-import re
+import sqlite3
 import threading
+import time
+from pathlib import Path
 
+import aiohttp
 import discord
-from discord.ext import commands
-from dotenv import load_dotenv
-from flask import Flask
+from aiohttp import web
+from discord import app_commands
 
-# =========================================================
-# KONFIGURACJA
-# =========================================================
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("licensebot")
 
-load_dotenv()
-
-TOKEN = os.getenv("DISCORD_TOKEN")
-
-WELCOME_CHANNEL_ID = 1567940953040232551
-AUTO_ROLE_ID = 1568694462601887956
-TICKET_PANEL_CHANNEL_ID = 1568699441488076832
-
-# !!! WPISZ PRAWDZIWE ID ROLI ZARZĄDU !!!
-STAFF_ROLE_ID = 123456789012345678
-
-# =========================================================
-# OBRAZKI
-# =========================================================
-
-WELCOME_IMAGE_URL = (
-    "https://cdn.discordapp.com/attachments/"
-    "1569024383845007511/1569436242750472233/"
-    "a42800a3-c618-430e-808d-423899e55d90.png"
-    "?ex=6af372e6&is=6af22166"
-    "&hm=a78829c7f54cda65d5183b2264be55e8832b78b72b59fec505a40dd3dd416c05&"
-)
-
-TICKET_IMAGE_URL = (
-    "https://cdn.discordapp.com/attachments/"
-    "1569024383845007511/1569436255588974652/"
-    "3ca61350-1370-469d-b000-c9faa24424b0.png"
-    "?ex=6af372ea&is=6af2216a"
-    "&hm=46722fec18d4668e84ae22cc4e3db9808a6f056804bbe9661ade08a4e619654b&"
-)
-
-# Czysty rgb(0,0,0) Discord traktuje jak "brak koloru",
-# więc używamy prawie-czerni.
-COLOR = discord.Colour(0x010101)
-
-PORT = int(os.getenv("PORT", "8080"))
-
-# =========================================================
-# EMOJI
-# =========================================================
-
-EMOJI_MEMBER = "<:czlonek:1567976307302735902>"
-EMOJI_SUPER = "<:super:1567984387457421473>"
-EMOJI_RULES = "<:regulamin:1567980863826690159>"
-EMOJI_TICKET = "<:ticket:1567981310788509786>"
-EMOJI_WELCOME = "<:witaj:1567978044956737587>"
-
-EMOJI_RECRUITMENT = "<a:rekrutacja:1568746446528716920>"
-EMOJI_ALLIANCE = "<:sojusz:1568745977316114545>"
-EMOJI_QUESTION = "<:pytanie:1568742288249816530>"
-EMOJI_WARNING = "<:warning:1568745877059670086>"
-
-EMOJI_PERSON = "<:osoba_:1569027160235319306>"
-EMOJI_HASHTAG = "<:hasztag_:1569027212085043330>"
-EMOJI_PENCIL = "<:Dlugopis_:1569027448945905744>"
-
-# =========================================================
-# KATEGORIE TICKETÓW
-# =========================================================
-
-TICKET_TYPES = {
-    "rekrutacja": {
-        "label": "Rekrutacja",
-        "title": "REKRUTACJA",
-        "description": "Dołącz do gildii HUNT.",
-        "emoji": EMOJI_RECRUITMENT,
-        "fallback_emoji": "📝",
-        "category_id": 1568749095517036705,
-    },
-    "sojusz": {
-        "label": "Sojusz",
-        "title": "SOJUSZ",
-        "description": "Zaproponuj współpracę lub sojusz.",
-        "emoji": EMOJI_ALLIANCE,
-        "fallback_emoji": "🤝",
-        "category_id": 1568749019197608057,
-    },
-    "pytanie": {
-        "label": "Pomoc / Pytanie",
-        "title": "POMOC / PYTANIE",
-        "description": "Masz pytanie lub potrzebujesz pomocy?",
-        "emoji": EMOJI_QUESTION,
-        "fallback_emoji": "❓",
-        "category_id": 1568748991749816530,
-    },
-}
-
-# =========================================================
-# FLASK - KEEP ALIVE
-# =========================================================
-
-app = Flask(__name__)
-logging.getLogger("werkzeug").setLevel(logging.ERROR)
-
-
-@app.route("/")
-def home():
-    return "HUNT BOT ONLINE!"
-
-
-def run_flask():
-    app.run(host="0.0.0.0", port=PORT, use_reloader=False)
-
-
-# =========================================================
-# BOT
-# =========================================================
-
-intents = discord.Intents.default()
-intents.members = True
-intents.message_content = True
-
-
-class HUNTBot(commands.Bot):
-
-    async def setup_hook(self):
-        # Widoki persistent - działają po restarcie bota
-        self.add_view(TicketPanel())
-        self.add_view(CloseTicketView())
-
-
-bot = HUNTBot(command_prefix="!", intents=intents)
-panel_sent = False
-
-# =========================================================
-# FUNKCJE POMOCNICZE
-# =========================================================
-
-
-def clip(text: str, limit: int) -> str:
-    """Przycina tekst do limitu Discorda."""
-    text = (text or "").strip()
-
-    if not text:
-        return "Nie podano"
-
-    return text if len(text) <= limit else text[: limit - 1] + "…"
-
-
-def resolve_emoji(raw: str, fallback: str) -> str:
+CFG = json.loads(Path(__file__).with_name("config.json").read_text("utf-8"))
+DB = sqlite3.connect(Path(__file__).with_name("state.db"), check_same_thread=False)
+DBLOCK = threading.RLock()
+DB.executescript(
     """
-    Zwraca emoji serwerowe tylko jeśli bot je widzi.
-    W przeciwnym razie używa zwykłego emoji.
+    CREATE TABLE IF NOT EXISTS players(
+        key TEXT PRIMARY KEY, mc TEXT, server TEXT, version TEXT,
+        session_start INTEGER, last_ts INTEGER);
+    CREATE TABLE IF NOT EXISTS cmds(key TEXT PRIMARY KEY, cmd TEXT, ts INTEGER);
     """
+)
+DB.commit()
 
-    match = re.fullmatch(r"<a?:\w+:(\d+)>", raw or "")
 
-    if not match:
-        return raw or fallback
+def now_ms():
+    return int(time.time() * 1000)
 
-    if not bot.is_ready():
-        return fallback
 
-    if bot.get_emoji(int(match.group(1))) is None:
-        print(
-            f"Uwaga: emoji {raw} nie istnieje lub bot go nie widzi "
-            f"- używam zastępczego."
-        )
-        return fallback
+def now_s():
+    return int(time.time())
 
-    return raw
 
-
-def owner_topic(user_id: int) -> str:
-    return f"ticket-owner:{user_id}"
-
-
-def find_open_ticket(guild: discord.Guild, user_id: int):
-    """Zwraca otwarty ticket użytkownika lub None."""
-
-    topic = owner_topic(user_id)
-
-    for channel in guild.text_channels:
-        if channel.topic == topic:
-            return channel
-
-    return None
-
-
-def is_staff(member: discord.Member, guild: discord.Guild) -> bool:
-
-    staff_role = guild.get_role(STAFF_ROLE_ID)
-
-    if staff_role and staff_role in member.roles:
-        return True
-
-    return member.guild_permissions.administrator
-
-
-# =========================================================
-# POWITANIE
-# =========================================================
-
-
-def create_welcome_embed(member: discord.Member) -> discord.Embed:
-
-    embed = discord.Embed(
-        description=(
-            f"**Witaj {member.mention} na Serwerze Gildia HUNT**\n\n"
-            f"Cieszymy się, że z nami jesteś, mamy nadzieję że zostaniesz "
-            f"z nami na dłużej!\n"
-            f"Pamiętaj, aby zapoznać się z regulaminem serwera.\n\n"
-            f"Jesteś naszym **{member.guild.member_count}** użytkownikiem!"
-        ),
-        color=COLOR,
-    )
-
-    embed.set_image(url=WELCOME_IMAGE_URL)
-
-    return embed
-
-
-@bot.event
-async def on_member_join(member: discord.Member):
-
-    # Automatyczna rola
-    role = member.guild.get_role(AUTO_ROLE_ID)
-
-    if role:
-        try:
-            await member.add_roles(
-                role,
-                reason="Automatyczna rola"
-            )
-
-        except discord.Forbidden:
-            print(
-                "Bot nie ma uprawnień do nadania roli "
-                "(sprawdź hierarchię ról)."
-            )
-
-        except discord.HTTPException as error:
-            print(f"Błąd nadawania roli: {error}")
-
-    # Kanał powitań
-    channel = member.guild.get_channel(WELCOME_CHANNEL_ID)
-
-    if channel:
-        try:
-            await channel.send(
-                content=member.mention,
-                embed=create_welcome_embed(member)
-            )
-
-        except discord.HTTPException as error:
-            print(f"Błąd wysyłania powitania: {error}")
-
-
-@bot.command(name="testpowitanie")
-@commands.has_permissions(administrator=True)
-async def test_powitanie(ctx: commands.Context):
-
-    await ctx.send(
-        content=ctx.author.mention,
-        embed=create_welcome_embed(ctx.author)
-    )
-
-
-@bot.event
-async def on_command_error(ctx: commands.Context, error):
-
-    if isinstance(error, commands.CommandNotFound):
-        return
-
-    if isinstance(error, commands.MissingPermissions):
-        await ctx.send(
-            f"{EMOJI_WARNING} Nie masz uprawnień do tej komendy."
-        )
-        return
-
-    print(f"Błąd komendy: {error}")
-
-
-# =========================================================
-# EMBED TICKETA
-# =========================================================
-
-
-def create_ticket_embed(
-    user: discord.Member,
-    ticket_channel: discord.TextChannel,
-    ticket_type: str,
-    answers: dict,
-) -> discord.Embed:
-
-    title = TICKET_TYPES[ticket_type]["title"]
-
-    embed = discord.Embed(
-        title=f"TICKET • {title}",
-        description=(
-            f"{EMOJI_PERSON} **Zgłaszający:** {user.mention}\n"
-            f"{EMOJI_HASHTAG} **Kanał:** {ticket_channel.mention}\n"
-            f"{EMOJI_PENCIL} **Kategoria:** {title}"
-        ),
-        color=COLOR,
-        timestamp=discord.utils.utcnow(),
-    )
-
-    # Każda odpowiedź w osobnym polu
-    for question, answer in answers.items():
-
-        embed.add_field(
-            name=f"▸ {question}",
-            value=f">>> {clip(answer, 1000)}",
-            inline=False,
-        )
-
-    embed.set_author(
-        name="GILDIA HUNT • SYSTEM TICKET",
-        icon_url=(
-            user.guild.icon.url
-            if user.guild.icon
-            else None
-        ),
-    )
-
-    embed.set_thumbnail(url=user.display_avatar.url)
-
-    embed.set_footer(
-        text="HUNT • SYSTEM ZGŁOSZEŃ"
-    )
-
-    return embed
-
-
-# =========================================================
-# TWORZENIE TICKETÓW
-# =========================================================
-
-
-async def create_ticket(
-    interaction: discord.Interaction,
-    ticket_type: str,
-    answers: dict,
-):
-
-    await interaction.response.defer(ephemeral=True)
-
-    guild = interaction.guild
-
-    if guild is None:
-        await interaction.followup.send(
-            f"{EMOJI_WARNING} Nie udało się znaleźć serwera.",
-            ephemeral=True,
-        )
-        return
-
-    # Zabezpieczenie przed dublami
-    existing = find_open_ticket(
-        guild,
-        interaction.user.id
-    )
-
-    if existing:
-        await interaction.followup.send(
-            f"{EMOJI_WARNING} Masz już otwarty ticket: "
-            f"{existing.mention}",
-            ephemeral=True,
-        )
-        return
-
-    category = guild.get_channel(
-        TICKET_TYPES[ticket_type]["category_id"]
-    )
-
-    if not isinstance(
-        category,
-        discord.CategoryChannel
-    ):
-        await interaction.followup.send(
-            f"{EMOJI_WARNING} Nie znaleziono kategorii na serwerze. "
-            f"Sprawdź ID kategorii.",
-            ephemeral=True,
-        )
-        return
-
-    # =====================================================
-    # UPRAWNIENIA
-    # =====================================================
-
-    overwrites = {
-        guild.default_role:
-            discord.PermissionOverwrite(
-                view_channel=False
-            ),
-
-        interaction.user:
-            discord.PermissionOverwrite(
-                view_channel=True,
-                send_messages=True,
-                read_message_history=True,
-                attach_files=True,
-                embed_links=True,
-            ),
-    }
-
-    staff_role = guild.get_role(
-        STAFF_ROLE_ID
-    )
-
-    if staff_role:
-        overwrites[staff_role] = (
-            discord.PermissionOverwrite(
-                view_channel=True,
-                send_messages=True,
-                read_message_history=True,
-                attach_files=True,
-                embed_links=True,
-            )
-        )
-
-    if guild.me:
-        overwrites[guild.me] = (
-            discord.PermissionOverwrite(
-                view_channel=True,
-                send_messages=True,
-                manage_channels=True,
-                read_message_history=True,
-                embed_links=True,
-            )
-        )
-
-    # =====================================================
-    # NAZWA KANAŁU
-    # =====================================================
-
-    username = re.sub(
-        r"[^a-z0-9-]",
-        "",
-        interaction.user.name.lower().replace(" ", "-")
-    )
-
-    if not username:
-        username = str(
-            interaction.user.id
-        )[-4:]
-
-    channel_name = (
-        f"{ticket_type}-{username}"
-    )[:90]
-
-    # =====================================================
-    # TWORZENIE KANAŁU
-    # =====================================================
-
-    try:
-
-        ticket_channel = await guild.create_text_channel(
-            name=channel_name,
-            category=category,
-            overwrites=overwrites,
-            topic=owner_topic(
-                interaction.user.id
-            ),
-            reason=(
-                f"Ticket użytkownika "
-                f"{interaction.user}"
-            ),
-        )
-
-        embed = create_ticket_embed(
-            interaction.user,
-            ticket_channel,
-            ticket_type,
-            answers,
-        )
-
-        await ticket_channel.send(
-            content=interaction.user.mention,
-            embed=embed,
-            view=CloseTicketView(),
-        )
-
-        await interaction.followup.send(
-            f"{EMOJI_TICKET} Utworzono ticket: "
-            f"{ticket_channel.mention}",
-            ephemeral=True,
-        )
-
-    except discord.Forbidden:
-
-        await interaction.followup.send(
-            f"{EMOJI_WARNING} Bot nie ma uprawnień "
-            f"do tworzenia kanałów ticketów.",
-            ephemeral=True,
-        )
-
-    except discord.HTTPException as error:
-
-        print(
-            f"Błąd tworzenia ticketa: {error}"
-        )
-
-        await interaction.followup.send(
-            f"{EMOJI_WARNING} Wystąpił błąd "
-            f"podczas tworzenia ticketa.",
-            ephemeral=True,
-        )
-
-
-# =========================================================
-# FORMULARZE
-# =========================================================
-
-
-class RecruitmentModal(
-    discord.ui.Modal,
-    title="REKRUTACJA HUNT"
-):
-
-    dlaczego = discord.ui.TextInput(
-        label="Dlaczego chcesz dołączyć do HUNT?",
-        placeholder="Napisz, dlaczego chcesz dołączyć...",
-        style=discord.TextStyle.paragraph,
-        max_length=1000,
-    )
-
-    pvp = discord.ui.TextInput(
-        label="Jak oceniasz swoje umiejętności PVP?",
-        placeholder="Opisz swoje umiejętności...",
-        style=discord.TextStyle.paragraph,
-        max_length=1000,
-    )
-
-    wiek_premium = discord.ui.TextInput(
-        label="Ile masz lat i czy posiadasz premium?",
-        placeholder="Wiek oraz informacja o premium...",
-        max_length=200,
-    )
-
-    main = discord.ui.TextInput(
-        label="Jaki jest Twój główny tryb?",
-        placeholder="Podaj swój główny tryb...",
-        max_length=200,
-    )
-
-    gildie = discord.ui.TextInput(
-        label="W jakich gildiach wcześniej grałeś?",
-        placeholder="Wymień poprzednie gildie...",
-        style=discord.TextStyle.paragraph,
-        required=False,
-        max_length=1000,
-    )
-
-    async def on_submit(
-        self,
-        interaction: discord.Interaction
-    ):
-
-        answers = {
-            "Dlaczego chcesz dołączyć do HUNT?":
-                self.dlaczego.value,
-
-            "Umiejętności PVP":
-                self.pvp.value,
-
-            "Wiek i konto premium":
-                self.wiek_premium.value,
-
-            "Główny tryb":
-                self.main.value,
-
-            "Poprzednie gildie":
-                self.gildie.value,
-        }
-
-        await create_ticket(
-            interaction,
-            "rekrutacja",
-            answers
-        )
-
-
-class AllianceModal(
-    discord.ui.Modal,
-    title="SOJUSZ HUNT"
-):
-
-    tag = discord.ui.TextInput(
-        label="Jaki jest TAG Twojej gildii?",
-        placeholder="Podaj TAG gildii...",
-        max_length=100,
-    )
-
-    czlonkowie = discord.ui.TextInput(
-        label="Ilu członków liczy Twoja gildia?",
-        placeholder="Podaj liczbę członków...",
-        max_length=100,
-    )
-
-    lider = discord.ui.TextInput(
-        label="Kto jest liderem gildii?",
-        placeholder="Podaj nick lidera...",
-        max_length=100,
-    )
-
-    serwery = discord.ui.TextInput(
-        label="Na jakich serwerach gracie?",
-        placeholder="Podaj serwery...",
-        style=discord.TextStyle.paragraph,
-        max_length=500,
-    )
-
-    pvp = discord.ui.TextInput(
-        label="Czy gildia bierze udział w PVP?",
-        placeholder="Napisz coś o aktywności PVP...",
-        style=discord.TextStyle.paragraph,
-        max_length=500,
-    )
-
-    async def on_submit(
-        self,
-        interaction: discord.Interaction
-    ):
-
-        answers = {
-            "TAG gildii":
-                self.tag.value,
-
-            "Liczba członków":
-                self.czlonkowie.value,
-
-            "Lider gildii":
-                self.lider.value,
-
-            "Serwery":
-                self.serwery.value,
-
-            "Aktywność PVP":
-                self.pvp.value,
-        }
-
-        await create_ticket(
-            interaction,
-            "sojusz",
-            answers
-        )
-
-
-class QuestionModal(
-    discord.ui.Modal,
-    title="POMOC / PYTANIE"
-):
-
-    pytanie = discord.ui.TextInput(
-        label="W czym potrzebujesz pomocy?",
-        placeholder="Opisz swoje pytanie...",
-        style=discord.TextStyle.paragraph,
-        max_length=1500,
-    )
-
-    problem = discord.ui.TextInput(
-        label="Dodatkowe informacje",
-        placeholder="Możesz podać dodatkowe informacje...",
-        style=discord.TextStyle.paragraph,
-        required=False,
-        max_length=1000,
-    )
-
-    async def on_submit(
-        self,
-        interaction: discord.Interaction
-    ):
-
-        answers = {
-            "W czym potrzebujesz pomocy?":
-                self.pytanie.value,
-
-            "Dodatkowe informacje":
-                self.problem.value,
-        }
-
-        await create_ticket(
-            interaction,
-            "pytanie",
-            answers
-        )
-
-
-MODALS = {
-    "rekrutacja": RecruitmentModal,
-    "sojusz": AllianceModal,
-    "pytanie": QuestionModal,
-}
-
-# =========================================================
-# MENU WYBORU TICKETA
-# =========================================================
-
-
-class TicketPanelSelect(
-    discord.ui.Select
-):
-
+class Bin:
     def __init__(self):
+        self.url = f"https://api.jsonbin.io/v3/b/{CFG['jsonbin_bin_id']}"
+        self.headers = {"X-Master-Key": CFG["jsonbin_master_key"], "Content-Type": "application/json"}
+        self.session = None
+        self.cache = None
+        self.cache_at = 0.0
+        self.lock = asyncio.Lock()
 
-        options = [
-            discord.SelectOption(
-                label=data["label"],
-                description=data["description"],
-                value=key,
-                emoji=resolve_emoji(
-                    data["emoji"],
-                    data["fallback_emoji"]
-                ),
-            )
+    async def start(self):
+        self.session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15))
 
-            for key, data
-            in TICKET_TYPES.items()
-        ]
+    async def read(self, fresh=False):
+        if not fresh and self.cache is not None and time.time() - self.cache_at < CFG["cache_seconds"]:
+            return self.cache
+        async with self.session.get(self.url + "/latest", headers={**self.headers, "X-Bin-Meta": "false"}) as r:
+            r.raise_for_status()
+            data = await r.json()
+        if isinstance(data, dict) and "record" in data and "metadata" in data:
+            data = data["record"]
+        self.cache, self.cache_at = data, time.time()
+        return data
 
-        super().__init__(
-            placeholder="Wybierz kategorię ticketa...",
-            min_values=1,
-            max_values=1,
-            options=options,
-            custom_id="hunt_ticket_category_select",
-        )
-
-    async def callback(
-        self,
-        interaction: discord.Interaction
-    ):
-
-        guild = interaction.guild
-
-        # Jeśli użytkownik ma już ticket
-        if guild:
-
-            existing = find_open_ticket(
-                guild,
-                interaction.user.id
-            )
-
-            if existing:
-
-                await interaction.response.send_message(
-                    f"{EMOJI_WARNING} Masz już otwarty ticket: "
-                    f"{existing.mention}",
-                    ephemeral=True,
-                )
-
-                await self._reset_panel(
-                    interaction
-                )
-
-                return
-
-        modal_class = MODALS.get(
-            self.values[0]
-        )
-
-        if modal_class is None:
-
-            await interaction.response.send_message(
-                f"{EMOJI_WARNING} Nieznana kategoria.",
-                ephemeral=True,
-            )
-
-            return
-
-        await interaction.response.send_modal(
-            modal_class()
-        )
-
-        await self._reset_panel(
-            interaction
-        )
+    async def write(self, data):
+        async with self.session.put(self.url, headers=self.headers, data=json.dumps(data)) as r:
+            r.raise_for_status()
+        self.cache, self.cache_at = data, time.time()
 
     @staticmethod
-    async def _reset_panel(
-        interaction: discord.Interaction
-    ):
+    def entries(data):
+        keys = data.get("keys", []) if isinstance(data, dict) else []
+        return [e for e in keys if isinstance(e, dict)]
 
-        """
-        Czyści zaznaczenie w menu,
-        żeby można było wybrać tę samą opcję ponownie.
-        """
+    def find(self, data, key):
+        for e in self.entries(data):
+            if str(e.get("key", "")) == key:
+                return e
+        return None
 
-        if interaction.message is None:
-            return
-
-        try:
-
-            await interaction.message.edit(
-                view=TicketPanel()
-            )
-
-        except discord.HTTPException:
-            pass
-
-
-# =========================================================
-# PANEL TICKETÓW - COMPONENTS V2
-# =========================================================
+    async def mutate(self, key, fn):
+        async with self.lock:
+            data = await self.read(fresh=True)
+            e = self.find(data, key)
+            if e is None:
+                return None
+            fn(e)
+            await self.write(data)
+            return e
 
 
-class TicketPanel(
-    discord.ui.LayoutView
-):
-
-    def __init__(self):
-
-        super().__init__(
-            timeout=None
-        )
-
-        container = discord.ui.Container(
-
-            # =================================================
-            # NAGŁÓWEK
-            # =================================================
-
-            discord.ui.TextDisplay(
-                "```🎫 GILDIA HUNT × TICKETY```"
-            ),
-
-            discord.ui.Separator(
-                visible=True,
-                spacing=discord.SeparatorSpacing.small
-            ),
-
-            # =================================================
-            # OPIS
-            # =================================================
-
-            discord.ui.TextDisplay(
-                f"{EMOJI_PENCIL}︲Potrzebujesz **pomocy**? "
-                f"A może chcesz odebrać nagrodę? "
-                f"**Wybierz** opcję z listy poniżej, "
-                f"aby **stworzyć** ticket"
-            ),
-
-            discord.ui.Separator(
-                visible=True,
-                spacing=discord.SeparatorSpacing.small
-            ),
-
-            # =================================================
-            # SELECT MENU
-            # =================================================
-
-            discord.ui.ActionRow(
-                TicketPanelSelect()
-            ),
-
-            discord.ui.Separator(
-                visible=True,
-                spacing=discord.SeparatorSpacing.small
-            ),
-
-            # =================================================
-            # OBRAZEK
-            # =================================================
-
-            discord.ui.MediaGallery(
-                discord.MediaGalleryItem(
-                    TICKET_IMAGE_URL
-                )
-            ),
-
-            accent_colour=COLOR,
-        )
-
-        self.add_item(container)
+BIN = Bin()
 
 
-# =========================================================
-# ZAMYKANIE TICKETÓW
-# =========================================================
+def ban_entry(e, reason):
+    if not e.get("banned"):
+        e["banned"] = True
+        e["expires_before_ban"] = e.get("expires", 0)
+        e["days_before_ban"] = e.get("days", 7)
+    e["ban_reason"] = reason
+    e["expires"] = 1
+    e["days"] = 0
 
 
-class CloseTicketView(
-    discord.ui.View
-):
-
-    def __init__(self):
-
-        super().__init__(
-            timeout=None
-        )
-
-    @discord.ui.button(
-        label="Zamknij ticket",
-        style=discord.ButtonStyle.danger,
-        emoji="🔒",
-        custom_id="hunt_close_ticket",
-    )
-    async def close_ticket(
-        self,
-        interaction: discord.Interaction,
-        button: discord.ui.Button,
-    ):
-
-        channel = interaction.channel
-        guild = interaction.guild
-
-        if (
-            not isinstance(
-                channel,
-                discord.TextChannel
-            )
-            or guild is None
-        ):
-
-            await interaction.response.send_message(
-                f"{EMOJI_WARNING} Nie można zamknąć tego kanału.",
-                ephemeral=True,
-            )
-
-            return
-
-        owner = (
-            channel.topic
-            == owner_topic(
-                interaction.user.id
-            )
-        )
-
-        if (
-            not owner
-            and not is_staff(
-                interaction.user,
-                guild
-            )
-        ):
-
-            await interaction.response.send_message(
-                f"{EMOJI_WARNING} Nie masz uprawnień "
-                f"do zamknięcia tego ticketa.",
-                ephemeral=True,
-            )
-
-            return
-
-        embed = discord.Embed(
-            description=(
-                f"🔒 Ticket zostanie zamknięty za **5 sekund**.\n"
-                f"Zamyka: {interaction.user.mention}"
-            ),
-            color=COLOR,
-        )
-
-        await interaction.response.send_message(
-            embed=embed
-        )
-
-        await asyncio.sleep(5)
-
-        try:
-
-            await channel.delete(
-                reason=(
-                    f"Ticket zamknięty przez "
-                    f"{interaction.user}"
-                )
-            )
-
-        except discord.NotFound:
-            pass
-
-        except discord.Forbidden:
-            print(
-                "Bot nie ma uprawnień "
-                "do usunięcia kanału."
-            )
-
-        except discord.HTTPException as error:
-            print(
-                f"Błąd usuwania ticketa: {error}"
-            )
+def unban_entry(e):
+    if e.get("banned"):
+        e["expires"] = e.pop("expires_before_ban", 0)
+        e["days"] = e.pop("days_before_ban", 7)
+    e.pop("banned", None)
+    e.pop("ban_reason", None)
 
 
-# =========================================================
-# WYSYŁANIE PANELU
-# =========================================================
+def queue_cmd(key, cmd):
+    with DBLOCK:
+        DB.execute("INSERT OR REPLACE INTO cmds(key,cmd,ts) VALUES(?,?,?)", (key, cmd, now_s()))
+        DB.commit()
 
 
-async def send_ticket_panel():
+def pop_cmd(key):
+    with DBLOCK:
+        row = DB.execute("SELECT cmd,ts FROM cmds WHERE key=?", (key,)).fetchone()
+        if not row:
+            return None
+        DB.execute("DELETE FROM cmds WHERE key=?", (key,))
+        DB.commit()
+    return row[0] if now_s() - row[1] <= CFG["command_ttl_seconds"] else None
 
+
+def player(key):
+    with DBLOCK:
+        return DB.execute("SELECT mc,server,version,session_start,last_ts FROM players WHERE key=?", (key,)).fetchone()
+
+
+def is_online(key):
+    p = player(key)
+    return bool(p) and now_s() - p[4] <= CFG["online_timeout_seconds"]
+
+
+intents = discord.Intents.none()
+client = discord.Client(intents=intents)
+tree = app_commands.CommandTree(client)
+NAMES = {}
+
+
+async def dc_name(e):
+    d = e.get("discord")
+    uid = None
+    fallback = None
+    if isinstance(d, dict):
+        uid = d.get("id")
+        fallback = d.get("username") or d.get("name")
+    elif d:
+        uid = d
+    if not uid:
+        return "—"
+    uid = str(uid)
+    if uid in NAMES:
+        return NAMES[uid]
     try:
+        u = client.get_user(int(uid)) or await client.fetch_user(int(uid))
+        NAMES[uid] = f"{u.name} ({uid})"
+    except Exception:
+        NAMES[uid] = f"{fallback or 'nieznany'} ({uid})"
+    return NAMES[uid]
 
-        channel = await bot.fetch_channel(
-            TICKET_PANEL_CHANNEL_ID
+
+def status_of(e):
+    if e.get("banned"):
+        return "🔴 ban"
+    if not e.get("hwid"):
+        return "⚫ nieaktywowany"
+    if int(e.get("expires", 0) or 0) <= now_ms():
+        return "⚪ wygasł"
+    return "🟢 online" if is_online(str(e.get("key"))) else "🟡 offline"
+
+
+def is_admin(i: discord.Interaction):
+    if i.user.id in CFG["admin_user_ids"]:
+        return True
+    roles = getattr(i.user, "roles", [])
+    return any(r.id in CFG["admin_role_ids"] for r in roles)
+
+
+async def admin_check(i: discord.Interaction):
+    if is_admin(i):
+        return True
+    await i.response.send_message("Brak uprawnień.", ephemeral=True)
+    return False
+
+
+class Pager(discord.ui.View):
+    def __init__(self, user_id, title, lines, per=10, color=0x5865F2):
+        super().__init__(timeout=180)
+        self.user_id, self.title, self.color = user_id, title, color
+        self.pages = ["\n\n".join(lines[i:i + per]) for i in range(0, len(lines), per)] or ["Brak wyników."]
+        self.idx = 0
+        self.prev.disabled = True
+        self.next.disabled = len(self.pages) <= 1
+
+    def embed(self):
+        return discord.Embed(title=self.title, description=self.pages[self.idx], color=self.color).set_footer(
+            text=f"Strona {self.idx + 1}/{len(self.pages)}"
         )
 
-    except discord.NotFound:
+    async def flip(self, i, d):
+        if i.user.id != self.user_id:
+            return await i.response.send_message("To nie Twój panel.", ephemeral=True)
+        self.idx = max(0, min(len(self.pages) - 1, self.idx + d))
+        self.prev.disabled = self.idx == 0
+        self.next.disabled = self.idx == len(self.pages) - 1
+        await i.response.edit_message(embed=self.embed(), view=self)
 
-        print(
-            "Nie znaleziono kanału panelu ticketów."
-        )
+    @discord.ui.button(label="◀", style=discord.ButtonStyle.secondary)
+    async def prev(self, i, b):
+        await self.flip(i, -1)
 
-        return
+    @discord.ui.button(label="▶", style=discord.ButtonStyle.secondary)
+    async def next(self, i, b):
+        await self.flip(i, 1)
 
-    except discord.Forbidden:
 
-        print(
-            "Bot nie ma dostępu do kanału panelu."
-        )
-
-        return
-
-    if not isinstance(
-        channel,
-        discord.TextChannel
-    ):
-
-        print(
-            "Podane ID nie jest kanałem tekstowym."
-        )
-
-        return
-
+async def key_ac(i: discord.Interaction, cur: str):
     try:
+        data = await BIN.read()
+    except Exception:
+        return []
+    out = []
+    for e in BIN.entries(data):
+        k = str(e.get("key", ""))
+        p = player(k)
+        label = f"{k} • {p[0] if p and p[0] else '-'}"
+        if cur.lower() in label.lower():
+            out.append(app_commands.Choice(name=label[:100], value=k[:100]))
+        if len(out) >= 25:
+            break
+    return out
 
-        # Usuwamy stare panele bota,
-        # żeby po restarcie nie było duplikatów.
 
-        async for message in channel.history(
-            limit=25
-        ):
+async def load_entry(i, key):
+    try:
+        data = await BIN.read(fresh=True)
+    except Exception as ex:
+        await i.followup.send(f"Błąd połączenia z bazą kluczy: `{ex}`", ephemeral=True)
+        return None
+    e = BIN.find(data, key)
+    if e is None:
+        await i.followup.send("Nie ma takiego klucza.", ephemeral=True)
+    return e
 
-            if (
-                message.author.id
-                == bot.user.id
-            ):
 
-                try:
+@tree.command(name="keyban", description="Banuje klucz licencyjny")
+@app_commands.describe(key="Klucz licencyjny", reason="Powód")
+@app_commands.autocomplete(key=key_ac)
+async def keyban(i: discord.Interaction, key: str, reason: str = "brak powodu"):
+    if not await admin_check(i):
+        return
+    await i.response.defer(ephemeral=True)
+    try:
+        e = await BIN.mutate(key, lambda x: ban_entry(x, reason))
+    except Exception as ex:
+        return await i.followup.send(f"Błąd zapisu: `{ex}`", ephemeral=True)
+    if e is None:
+        return await i.followup.send("Nie ma takiego klucza.", ephemeral=True)
+    queue_cmd(key, "quit")
+    await i.followup.send(f"Zbanowano `{key}` ({reason}). Jeśli gracz jest online, gra zostanie zamknięta.", ephemeral=True)
 
-                    await message.delete()
 
-                except discord.HTTPException:
-                    pass
+@tree.command(name="keyunban", description="Odbanowuje klucz licencyjny")
+@app_commands.autocomplete(key=key_ac)
+async def keyunban(i: discord.Interaction, key: str):
+    if not await admin_check(i):
+        return
+    await i.response.defer(ephemeral=True)
+    try:
+        e = await BIN.mutate(key, unban_entry)
+    except Exception as ex:
+        return await i.followup.send(f"Błąd zapisu: `{ex}`", ephemeral=True)
+    with DBLOCK:
+        DB.execute("DELETE FROM cmds WHERE key=?", (key,))
+        DB.commit()
+    await i.followup.send("Odbanowano." if e else "Nie ma takiego klucza.", ephemeral=True)
 
-        await channel.send(
-            view=TicketPanel()
+
+@tree.command(name="quit", description="Wyłącza grę graczowi podpiętemu pod klucz")
+@app_commands.autocomplete(key=key_ac)
+async def quit_cmd(i: discord.Interaction, key: str):
+    if not await admin_check(i):
+        return
+    await i.response.defer(ephemeral=True)
+    e = await load_entry(i, key)
+    if e is None:
+        return
+    queue_cmd(key, "quit")
+    if is_online(key):
+        p = player(key)
+        msg = f"Wysłano `quit` dla **{p[0] or '?'}** ({await dc_name(e)}). Gra zamknie się przy najbliższym pingu klienta."
+    else:
+        msg = f"Gracz jest offline. Komenda poczeka do {CFG['command_ttl_seconds']}s na jego połączenie."
+    await i.followup.send(msg, ephemeral=True)
+
+
+@tree.command(name="keylist", description="Lista kluczy z nickami Discord i Minecraft")
+async def keylist(i: discord.Interaction):
+    if not await admin_check(i):
+        return
+    await i.response.defer(ephemeral=True)
+    try:
+        data = await BIN.read(fresh=True)
+    except Exception as ex:
+        return await i.followup.send(f"Błąd połączenia z bazą kluczy: `{ex}`", ephemeral=True)
+    lines = []
+    for e in BIN.entries(data):
+        k = str(e.get("key", ""))
+        p = player(k)
+        exp = int(e.get("expires", 0) or 0)
+        exp_txt = f"<t:{exp // 1000}:R>" if exp > 1 and e.get("hwid") else "—"
+        lines.append(
+            f"`{k}` {status_of(e)}\n👤 {await dc_name(e)} • ⛏ {p[0] if p and p[0] else '—'} • ⏳ {exp_txt}"
         )
+    view = Pager(i.user.id, f"Klucze ({len(lines)})", lines)
+    await i.followup.send(embed=view.embed(), view=view, ephemeral=True)
 
-        print(
-            "Wysłano panel ticketów HUNT."
+
+async def online_list(i: discord.Interaction):
+    if not await admin_check(i):
+        return
+    await i.response.defer(ephemeral=True)
+    try:
+        data = await BIN.read()
+    except Exception as ex:
+        return await i.followup.send(f"Błąd połączenia z bazą kluczy: `{ex}`", ephemeral=True)
+    lines = []
+    for e in BIN.entries(data):
+        k = str(e.get("key", ""))
+        if not is_online(k):
+            continue
+        p = player(k)
+        lines.append(
+            f"`{k}`\n👤 {await dc_name(e)} • ⛏ **{p[0] or '?'}**\n"
+            f"🌐 {p[1] or '—'} • 🎮 {p[2] or '—'} • ⏱ <t:{p[3]}:R>"
         )
+    view = Pager(i.user.id, f"Online ({len(lines)})", lines, color=0x57F287)
+    await i.followup.send(embed=view.embed(), view=view, ephemeral=True)
 
-    except discord.Forbidden:
 
-        print(
-            "Bot nie ma uprawnień do "
-            "wysyłania/usuwania wiadomości "
-            "w kanale panelu."
+tree.command(name="keyonline", description="Klucze, które teraz grają w Minecrafta")(online_list)
+tree.command(name="keyactive", description="Alias: klucze online")(online_list)
+
+
+app = Flask(__name__)
+LOOP = None
+
+
+def run_async(coro):
+    return asyncio.run_coroutine_threadsafe(coro, LOOP).result(timeout=20)
+
+
+@app.post("/api/heartbeat")
+def heartbeat():
+    if CFG["api_secret"] and request.headers.get("X-Api-Secret") != CFG["api_secret"]:
+        return jsonify(ok=False), 401
+    d = request.get_json(silent=True)
+    if not isinstance(d, dict):
+        return jsonify(ok=False), 400
+    key, hwid = str(d.get("key", "")), str(d.get("hwid", ""))
+    try:
+        e = BIN.find(run_async(BIN.read()), key)
+    except Exception:
+        return jsonify(ok=True, cmd=pop_cmd(key))
+    if e is None or (e.get("hwid") and str(e["hwid"]) != hwid):
+        return jsonify(ok=False)
+    if e.get("banned"):
+        return jsonify(ok=False, cmd="quit")
+    t = now_s()
+    row = player(key)
+    start = row[3] if row and t - row[4] <= CFG["online_timeout_seconds"] else t
+    with DBLOCK:
+        DB.execute(
+            "INSERT OR REPLACE INTO players(key,mc,server,version,session_start,last_ts) VALUES(?,?,?,?,?,?)",
+            (key, str(d.get("mc", ""))[:32], str(d.get("server", ""))[:100], str(d.get("version", ""))[:20], start, t),
         )
-
-    except discord.HTTPException as error:
-
-        print(
-            f"Błąd wysyłania panelu: {error}"
-        )
+        DB.commit()
+    return jsonify(ok=True, cmd=pop_cmd(key))
 
 
-# =========================================================
-# ON READY
-# =========================================================
+@app.get("/api/ping")
+def ping():
+    return jsonify(ok=True)
 
 
-@bot.event
+@client.event
 async def on_ready():
-
-    global panel_sent
-
-    print("--------------------------------")
-    print(
-        f"Zalogowano jako: {bot.user}"
-    )
-    print(
-        f"ID bota: {bot.user.id}"
-    )
-    print("--------------------------------")
-
-    if not panel_sent:
-
-        panel_sent = True
-
-        await send_ticket_panel()
+    log.info("Zalogowano jako %s", client.user)
 
 
-# =========================================================
-# URUCHOMIENIE
-# =========================================================
-
-
-if __name__ == "__main__":
-
-    if not TOKEN:
-        raise ValueError(
-            "Brak tokena! "
-            "Dodaj DISCORD_TOKEN do pliku .env"
-        )
-
+async def setup():
+    global LOOP
+    LOOP = asyncio.get_running_loop()
+    await BIN.start()
     threading.Thread(
-        target=run_flask,
-        daemon=True
+        target=lambda: app.run(host=CFG["api_host"], port=CFG["api_port"], threaded=True, use_reloader=False),
+        daemon=True,
     ).start()
+    guild = discord.Object(id=CFG["guild_id"]) if CFG["guild_id"] else None
+    if guild:
+        tree.copy_global_to(guild=guild)
+        await tree.sync(guild=guild)
+    else:
+        await tree.sync()
 
-    bot.run(TOKEN)
+
+client.setup_hook = setup
+client.run(CFG["discord_token"])
