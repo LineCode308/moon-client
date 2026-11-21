@@ -1,0 +1,13 @@
+{
+  "guild_id": 1573794839122935868,
+  "admin_user_ids": [1425113669666209973],
+  "admin_role_ids": [1573804520369168404],
+  "jsonbin_bin_id": "6b01f5fdac6210605a9a9a61",
+  "jsonbin_master_key": "$2a$10$VPxPdFem2IiQfL7PB3ipw.u.jpXQLcFGLTZ8WV0AsGu7YtV1qbixK",
+  "api_host": "0.0.0.0",
+  "api_port": 8787,
+  "api_secret": "",
+  "online_timeout_seconds": 45,
+  "cache_seconds": 20,
+  "command_ttl_seconds": 600
+}
