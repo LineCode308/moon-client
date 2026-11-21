@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import os
 import sqlite3
 import threading
 import time
@@ -8,13 +9,51 @@ from pathlib import Path
 
 import aiohttp
 import discord
-from aiohttp import web
 from discord import app_commands
+from flask import Flask, jsonify, request
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("licensebot")
 
-CFG = json.loads(Path(__file__).with_name("config.json").read_text("utf-8"))
+CFG = {
+    "discord_token": "",
+    "guild_id": 0,
+    "admin_user_ids": [],
+    "admin_role_ids": [],
+    "jsonbin_bin_id": "",
+    "jsonbin_master_key": "",
+    "api_host": "0.0.0.0",
+    "api_port": 8787,
+    "api_secret": "",
+    "online_timeout_seconds": 45,
+    "cache_seconds": 20,
+    "command_ttl_seconds": 600,
+}
+_cfg_file = Path(__file__).with_name("config.json")
+if _cfg_file.exists():
+    CFG.update(json.loads(_cfg_file.read_text("utf-8")))
+
+
+def _env_ids(name):
+    return [int(x) for x in os.environ.get(name, "").replace(" ", "").split(",") if x]
+
+
+for _k, _env in (
+    ("discord_token", "DISCORD_TOKEN"),
+    ("jsonbin_bin_id", "JSONBIN_BIN_ID"),
+    ("jsonbin_master_key", "JSONBIN_MASTER_KEY"),
+    ("api_secret", "API_SECRET"),
+):
+    if os.environ.get(_env):
+        CFG[_k] = os.environ[_env]
+if os.environ.get("GUILD_ID"):
+    CFG["guild_id"] = int(os.environ["GUILD_ID"])
+if os.environ.get("ADMIN_USER_IDS"):
+    CFG["admin_user_ids"] = _env_ids("ADMIN_USER_IDS")
+if os.environ.get("ADMIN_ROLE_IDS"):
+    CFG["admin_role_ids"] = _env_ids("ADMIN_ROLE_IDS")
+if not CFG["discord_token"] or not CFG["jsonbin_master_key"]:
+    raise SystemExit("Brak DISCORD_TOKEN lub JSONBIN_MASTER_KEY (zmienne środowiskowe albo config.json)")
 DB = sqlite3.connect(Path(__file__).with_name("state.db"), check_same_thread=False)
 DBLOCK = threading.RLock()
 DB.executescript(
@@ -134,6 +173,7 @@ def is_online(key):
 
 
 intents = discord.Intents.none()
+intents.guilds = True
 client = discord.Client(intents=intents)
 tree = app_commands.CommandTree(client)
 NAMES = {}
@@ -395,7 +435,7 @@ async def setup():
     LOOP = asyncio.get_running_loop()
     await BIN.start()
     threading.Thread(
-        target=lambda: app.run(host=CFG["api_host"], port=CFG["api_port"], threaded=True, use_reloader=False),
+        target=lambda: app.run(host="0.0.0.0", port=int(os.environ.get("PORT", CFG["api_port"])), threaded=True, use_reloader=False),
         daemon=True,
     ).start()
     guild = discord.Object(id=CFG["guild_id"]) if CFG["guild_id"] else None
