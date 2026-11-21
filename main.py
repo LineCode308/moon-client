@@ -404,7 +404,7 @@ def heartbeat():
         e = BIN.find(run_async(BIN.read()), key)
     except Exception:
         return jsonify(ok=True, cmd=pop_cmd(key))
-    if e is None or (e.get("hwid") and str(e["hwid"]) != hwid):
+    if e is None or (hwid and e.get("hwid") and str(e["hwid"]) != hwid):
         return jsonify(ok=False)
     if e.get("banned"):
         return jsonify(ok=False, cmd="quit")
