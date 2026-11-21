@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import sqlite3
+import threading
 import time
 from pathlib import Path
 
@@ -14,7 +15,8 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger("licensebot")
 
 CFG = json.loads(Path(__file__).with_name("config.json").read_text("utf-8"))
-DB = sqlite3.connect(Path(__file__).with_name("state.db"))
+DB = sqlite3.connect(Path(__file__).with_name("state.db"), check_same_thread=False)
+DBLOCK = threading.RLock()
 DB.executescript(
     """
     CREATE TABLE IF NOT EXISTS players(
@@ -106,21 +108,24 @@ def unban_entry(e):
 
 
 def queue_cmd(key, cmd):
-    DB.execute("INSERT OR REPLACE INTO cmds(key,cmd,ts) VALUES(?,?,?)", (key, cmd, now_s()))
-    DB.commit()
+    with DBLOCK:
+        DB.execute("INSERT OR REPLACE INTO cmds(key,cmd,ts) VALUES(?,?,?)", (key, cmd, now_s()))
+        DB.commit()
 
 
 def pop_cmd(key):
-    row = DB.execute("SELECT cmd,ts FROM cmds WHERE key=?", (key,)).fetchone()
-    if not row:
-        return None
-    DB.execute("DELETE FROM cmds WHERE key=?", (key,))
-    DB.commit()
+    with DBLOCK:
+        row = DB.execute("SELECT cmd,ts FROM cmds WHERE key=?", (key,)).fetchone()
+        if not row:
+            return None
+        DB.execute("DELETE FROM cmds WHERE key=?", (key,))
+        DB.commit()
     return row[0] if now_s() - row[1] <= CFG["command_ttl_seconds"] else None
 
 
 def player(key):
-    return DB.execute("SELECT mc,server,version,session_start,last_ts FROM players WHERE key=?", (key,)).fetchone()
+    with DBLOCK:
+        return DB.execute("SELECT mc,server,version,session_start,last_ts FROM players WHERE key=?", (key,)).fetchone()
 
 
 def is_online(key):
@@ -267,8 +272,9 @@ async def keyunban(i: discord.Interaction, key: str):
         e = await BIN.mutate(key, unban_entry)
     except Exception as ex:
         return await i.followup.send(f"Błąd zapisu: `{ex}`", ephemeral=True)
-    DB.execute("DELETE FROM cmds WHERE key=?", (key,))
-    DB.commit()
+    with DBLOCK:
+        DB.execute("DELETE FROM cmds WHERE key=?", (key,))
+        DB.commit()
     await i.followup.send("Odbanowano." if e else "Nie ma takiego klucza.", ephemeral=True)
 
 
@@ -338,31 +344,45 @@ tree.command(name="keyonline", description="Klucze, które teraz grają w Minecr
 tree.command(name="keyactive", description="Alias: klucze online")(online_list)
 
 
-async def heartbeat(req: web.Request):
-    if CFG["api_secret"] and req.headers.get("X-Api-Secret") != CFG["api_secret"]:
-        return web.json_response({"ok": False}, status=401)
+app = Flask(__name__)
+LOOP = None
+
+
+def run_async(coro):
+    return asyncio.run_coroutine_threadsafe(coro, LOOP).result(timeout=20)
+
+
+@app.post("/api/heartbeat")
+def heartbeat():
+    if CFG["api_secret"] and request.headers.get("X-Api-Secret") != CFG["api_secret"]:
+        return jsonify(ok=False), 401
+    d = request.get_json(silent=True)
+    if not isinstance(d, dict):
+        return jsonify(ok=False), 400
+    key, hwid = str(d.get("key", "")), str(d.get("hwid", ""))
     try:
-        d = await req.json()
-        key, hwid = str(d.get("key", "")), str(d.get("hwid", ""))
+        e = BIN.find(run_async(BIN.read()), key)
     except Exception:
-        return web.json_response({"ok": False}, status=400)
-    try:
-        e = BIN.find(await BIN.read(), key)
-    except Exception:
-        return web.json_response({"ok": True, "cmd": pop_cmd(key)})
+        return jsonify(ok=True, cmd=pop_cmd(key))
     if e is None or (e.get("hwid") and str(e["hwid"]) != hwid):
-        return web.json_response({"ok": False})
+        return jsonify(ok=False)
     if e.get("banned"):
-        return web.json_response({"ok": False, "cmd": "quit"})
+        return jsonify(ok=False, cmd="quit")
     t = now_s()
     row = player(key)
     start = row[3] if row and t - row[4] <= CFG["online_timeout_seconds"] else t
-    DB.execute(
-        "INSERT OR REPLACE INTO players(key,mc,server,version,session_start,last_ts) VALUES(?,?,?,?,?,?)",
-        (key, str(d.get("mc", ""))[:32], str(d.get("server", ""))[:100], str(d.get("version", ""))[:20], start, t),
-    )
-    DB.commit()
-    return web.json_response({"ok": True, "cmd": pop_cmd(key)})
+    with DBLOCK:
+        DB.execute(
+            "INSERT OR REPLACE INTO players(key,mc,server,version,session_start,last_ts) VALUES(?,?,?,?,?,?)",
+            (key, str(d.get("mc", ""))[:32], str(d.get("server", ""))[:100], str(d.get("version", ""))[:20], start, t),
+        )
+        DB.commit()
+    return jsonify(ok=True, cmd=pop_cmd(key))
+
+
+@app.get("/api/ping")
+def ping():
+    return jsonify(ok=True)
 
 
 @client.event
@@ -371,12 +391,13 @@ async def on_ready():
 
 
 async def setup():
+    global LOOP
+    LOOP = asyncio.get_running_loop()
     await BIN.start()
-    app = web.Application()
-    app.router.add_post("/api/heartbeat", heartbeat)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    await web.TCPSite(runner, CFG["api_host"], CFG["api_port"]).start()
+    threading.Thread(
+        target=lambda: app.run(host=CFG["api_host"], port=CFG["api_port"], threaded=True, use_reloader=False),
+        daemon=True,
+    ).start()
     guild = discord.Object(id=CFG["guild_id"]) if CFG["guild_id"] else None
     if guild:
         tree.copy_global_to(guild=guild)
