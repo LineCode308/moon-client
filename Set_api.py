@@ -23,7 +23,13 @@ with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zo:
 tmp = JAR + ".tmp"
 with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as zo:
     for it in outer.infolist():
-        zo.writestr(it, buf.getvalue() if it.filename == NESTED else outer.read(it.filename))
+        if it.filename == NESTED:
+            data = buf.getvalue()
+        elif it.filename == "moon-api.txt":
+            data = url.encode()
+        else:
+            data = outer.read(it.filename)
+        zo.writestr(it, data)
 outer.close()
 shutil.move(tmp, JAR)
 print("Ustawiono:", url)
